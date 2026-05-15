@@ -1,0 +1,129 @@
+name: First CI/CD handson
+on:
+  push:
+    branches: ["main"]
+env:
+  DH_IMAGE: devops11-basic-reactjs
+  TAG: v${{ github.run_number }}
+  USERNAME: ${{ secrets.USERNAME }}
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    environment: DH_ENV
+
+    steps:
+      # -----------------------------
+      # Checkout code
+      # -----------------------------
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      # -----------------------------
+      # Login DockerHub
+      # -----------------------------
+      - name: Login to Dockerhub
+        run: |
+          echo "${{ secrets.PASSWORD }}" | docker login -u ${{ secrets.USERNAME }} --password-stdin
+
+      # -----------------------------
+      # Build Image (v12, v13...)
+      # -----------------------------
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ secrets.USERNAME }}/${{ env.DH_IMAGE }}:${{ env.TAG }} .
+
+      # -----------------------------
+      # Install Trivy
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+      - name: Using Trivy for scanning docker images 
+        id: trivy
+        run: |
+          trivy image \
+            --format json \
+            --output trivy-report.json \
+            --severity CRITICAL,HIGH \
+            ${{ secrets.USERNAME }}/${{ env.DH_IMAGE }}:${{ env.TAG }} || true
+      - name: Parse vulnerabilities and Build Summary
+        run: |
+          # Count vulnerabilities
+          CRITICAL_COUNT=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-report.json || echo 0)
+          HIGH_COUNT=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-report.json || echo 0)
+          
+          # Extract top 5 Critical Vulnerabilities for the report
+          DETAIL_LIST=$(jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | "• \(.VulnerabilityID) (\(.PkgName))" ' trivy-report.json | head -n 10)
+          
+          # Save to Environment
+          echo "CRITICAL=$CRITICAL_COUNT" >> $GITHUB_ENV
+          echo "HIGH=$HIGH_COUNT" >> $GITHUB_ENV
+          
+          # Use a multiline environment variable for the details
+          {
+            echo "VULN_DETAILS<<EOF"
+            echo "$DETAIL_LIST"
+            echo "EOF"
+          } >> $GITHUB_ENV
+      - name: Send Telegram Report
+        #if: env.CRITICAL != '0' || env.HIGH != '0'
+        if: env.CRITICAL != '0' || fromJson(env.HIGH) > 5
+        run: |
+          # Build the multiline message
+          MESSAGE="🚨 *Docker Scan Results*
+          
+          *Image:* \`${{secrets.USERNAME}}/${{ env.DH_IMAGE }}:${{ env.TAG }}\`
+          *Critical:* ${{ env.CRITICAL }}
+          *High:* ${{ env.HIGH }}
+          
+          *Top Critical Issues:*
+          ${{ env.VULN_DETAILS }}
+          
+          _Check GitHub Action logs for full report._"
+
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+            -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -d parse_mode="Markdown" \
+            -d text="$MESSAGE"
+      - name: Fail if vulnerabilities found
+        if: env.CRITICAL != '0' || env.HIGH != '0'
+        #if: env.CRITICAL != '0' || fromJson(env.HIGH) > 0
+        run: exit 1 
+      # -----------------------------
+      # Push Image FIRST (important fix)
+      # -----------------------------
+      - name: Push Docker Image
+        run: |
+          docker push ${{ secrets.USERNAME }}/${{ env.DH_IMAGE }}:${{ env.TAG }}
+
+      # -----------------------------
+      # Deploy to GCP VM
+      # -----------------------------
+      - name: Deploy to Server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.GCP_HOST }}
+          username: ${{ secrets.GCP_USER }}
+          key: ${{ secrets.GCP_SSH_KEY }}
+          envs: DH_IMAGE,TAG,USERNAME
+
+          script: |
+            IMAGE="$USERNAME/$DH_IMAGE:$TAG"
+
+            echo "Deploying: $IMAGE"
+
+            docker pull "$IMAGE"
+            docker stop my-app || true
+            docker rm my-app || true
+            docker run -d --name my-app -p 3000:80 "$IMAGE"
+
+      # -----------------------------
+      # Cleanup
+      # -----------------------------
+      - name: Docker logout
+        if: always()
+        run: docker logout

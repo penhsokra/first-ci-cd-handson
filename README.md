@@ -1,1 +1,1 @@
-# first-CI-CD-handson
+# first-ci-cd-handson

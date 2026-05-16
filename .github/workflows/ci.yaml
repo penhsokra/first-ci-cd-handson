@@ -1,7 +1,7 @@
 name: First CI/CD handson
 on:
   push:
-    branches: ["main"]
+    branches: ["mainxxxxxxxxx"]
 env:
   DH_IMAGE: devops11-basic-reactjs
   TAG: v${{ github.run_number }}
